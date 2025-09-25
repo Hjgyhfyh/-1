@@ -13,10 +13,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -43,6 +42,11 @@ TG_UPLOAD_LIMIT = 49 * 1024 * 1024
 # === КУЛДАУН (CD) — 1 сообщение/сек на пользователя ===
 COOLDOWN_SECONDS = 1.0
 _LAST_MSG_TS: Dict[int, float] = {}
+
+# === КУЛДАУН НА ИСХОДЯЩИЕ СООБЩЕНИЯ ===
+BOT_SEND_COOLDOWN_SECONDS = 1.0
+_BOT_LAST_SEND_TS: float = 0.0
+_BOT_SEND_LOCK = asyncio.Lock()
 
 # === ЛОГИРОВАНИЕ ===
 logging.basicConfig(
@@ -204,6 +208,32 @@ def state_summary(state: PendingMerge) -> str:
     )
 
 
+# === ВСПОМОГАТЕЛЬНОЕ: отправка с учётом кулдауна ===
+async def _send_with_bot_cooldown(factory: Callable[[], Awaitable[Any]]) -> Any:
+    global _BOT_LAST_SEND_TS
+    async with _BOT_SEND_LOCK:
+        now = time.time()
+        delay = BOT_SEND_COOLDOWN_SECONDS - (now - _BOT_LAST_SEND_TS)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        try:
+            return await factory()
+        finally:
+            _BOT_LAST_SEND_TS = time.time()
+
+
+async def reply_text_cd(message: Optional[Message], text: str, **kwargs: Any) -> Any:
+    if not message:
+        return None
+    return await _send_with_bot_cooldown(lambda: message.reply_text(text, **kwargs))
+
+
+async def reply_document_cd(message: Optional[Message], **kwargs: Any) -> Any:
+    if not message:
+        return None
+    return await _send_with_bot_cooldown(lambda: message.reply_document(**kwargs))
+
+
 # === ХЕНДЛЕР КУЛДАУНА ===
 async def check_cooldown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.effective_message:
@@ -228,7 +258,8 @@ def _parse_options(text: str) -> Dict[str, str]:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+    await reply_text_cd(
+        update.message,
         "Команда: /merge [base=myapp] [windowed=1|0]\n"
         "Используйте кнопки ниже, чтобы управлять процессом.\n"
         "Лимит на один файл — 100 МБ. Telegram дополнительно ограничивает скачивание ботом файлами ≈20 МБ.",
@@ -243,7 +274,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     STATES.pop(uid, None)
-    await update.message.reply_text("Состояние сброшено.", reply_markup=build_menu_kb(PendingMerge()))
+    await reply_text_cd(
+        update.message,
+        "Состояние сброшено.",
+        reply_markup=build_menu_kb(PendingMerge()),
+    )
 
 
 async def cmd_merge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -255,7 +290,8 @@ async def cmd_merge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         windowed=(opts.get("windowed", "1") == "1"),
     )
     STATES[uid] = state
-    await update.message.reply_text(
+    await reply_text_cd(
+        update.message,
         "Готово. Пожалуйста, пришлите два файла (лимит 100 МБ на каждый).\n" + state_summary(state),
         reply_markup=build_menu_kb(state),
     )
@@ -345,25 +381,22 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # 1) Проверка пользовательского лимита (100 МБ)
     if doc.file_size and doc.file_size > USER_DOWNLOAD_LIMIT:
         mb = doc.file_size / (1024 * 1024)
-        await update.message.reply_text(
+        await reply_text_cd(
+            update.message,
             f"Вы отправили слишком большой файл ({mb:.1f} МБ). У вас лимит 100 МБ на файл.",
-            reply_markup=build_menu_kb(state),
         )
         return
 
     # 2) Уведомление о жёстком лимите Telegram (около 20 МБ для getFile)
     if doc.file_size and doc.file_size > TG_GETFILE_HARD_LIMIT:
-        await update.message.reply_text(
+        await reply_text_cd(
+            update.message,
             "Файл больше ≈20 МБ. Telegram не позволяет ботам скачивать такие файлы через API. "
             "Даже при лимите 100 МБ это ограничение нельзя обойти.",
-            reply_markup=build_menu_kb(state),
         )
         return
 
-    await update.message.reply_text(
-        f"Принимаю «{fname}»…",
-        reply_markup=build_menu_kb(state),
-    )
+    await reply_text_cd(update.message, f"Принимаю «{fname}»…")
     try:
         file = await doc.get_file()
         bio = BytesIO()
@@ -371,30 +404,27 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         data = bio.getvalue()
     except BadRequest as e:
         logger.warning("BadRequest on get_file: %s", e)
-        await update.message.reply_text(
+        await reply_text_cd(
+            update.message,
             "Не удалось скачать файл. Пожалуйста, попробуйте меньший файл.",
-            reply_markup=build_menu_kb(state),
         )
         return
     except Exception as e:
         logger.exception("Ошибка скачивания файла")
-        await update.message.reply_text(
+        await reply_text_cd(
+            update.message,
             f"Не удалось скачать «{fname}»: {e}",
-            reply_markup=build_menu_kb(state),
         )
         return
 
     if not isinstance(data, (bytes, bytearray)):
-        await update.message.reply_text(
-            "Не удалось получить содержимое файла.",
-            reply_markup=build_menu_kb(state),
-        )
+        await reply_text_cd(update.message, "Не удалось получить содержимое файла.")
         return
 
     if len(data) > USER_DOWNLOAD_LIMIT:
-        await update.message.reply_text(
+        await reply_text_cd(
+            update.message,
             "Полученный файл превышает лимит 100 МБ после скачивания. Пожалуйста, отправьте меньший файл.",
-            reply_markup=build_menu_kb(state),
         )
         return
 
@@ -404,19 +434,16 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if state.awaiting_icon:
         # (на всякий случай, не должно сработать — awaiting_icon сбрасывается в add_file)
-        await update.message.reply_text("Ожидаю иконку.", reply_markup=build_menu_kb(state))
+        await reply_text_cd(update.message, "Ожидаю иконку.")
         return
 
     if len(state.files) > before_files:
-        await update.message.reply_text(
+        await reply_text_cd(
+            update.message,
             f"Файл принят: {fname}. Всего файлов: {len(state.files)}.",
-            reply_markup=build_menu_kb(state),
         )
     else:
-        await update.message.reply_text(
-            f"Иконка обновлена: {fname}.",
-            reply_markup=build_menu_kb(state),
-        )
+        await reply_text_cd(update.message, f"Иконка обновлена: {fname}.")
 
     if state.ready():
         await _perform_merge(update, context, state)
@@ -435,7 +462,7 @@ async def _perform_merge(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
 
     (n1, b1), (n2, b2) = state.files[0], state.files[1]
 
-    await message.reply_text("Склеиваю файлы…", reply_markup=build_menu_kb(state))
+    await reply_text_cd(message, "Склеиваю файлы…")
     t1, enc1 = read_text_best_effort_bytes(b1)
     t2, enc2 = read_text_best_effort_bytes(b2)
     merged_text = merge_contents(t1, t2, n1, n2)
@@ -449,29 +476,24 @@ async def _perform_merge(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
 
     try:
         with merged_py.open("rb") as f:
-            await message.reply_document(
+            await reply_document_cd(
+                message,
                 document=f,
                 filename=merged_py.name,
-                caption=f"*_merged.py (кодировки: {enc1}, {enc2})",
-                parse_mode=ParseMode.MARKDOWN,
+                caption=f"{merged_py.name} (кодировки: {enc1}, {enc2})",
             )
         with pyinstall_path.open("rb") as f:
-            await message.reply_document(
+            await reply_document_cd(
+                message,
                 document=f,
                 filename=pyinstall_path.name,
                 caption="*.pyinstall",
             )
     except Exception as e:
         logger.exception("Ошибка отправки текстовых артефактов")
-        await message.reply_text(
-            f"Ошибка отправки промежуточных файлов: {e}",
-            reply_markup=build_menu_kb(state),
-        )
+        await reply_text_cd(message, f"Ошибка отправки промежуточных файлов: {e}")
 
-    await message.reply_text(
-        "Собираю .exe через PyInstaller…",
-        reply_markup=build_menu_kb(state),
-    )
+    await reply_text_cd(message, "Собираю .exe через PyInstaller…")
 
     # Сборка EXE — всегда включена
     icon_path: Optional[Path] = None
@@ -488,7 +510,8 @@ async def _perform_merge(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
 
     try:
         with log_file.open("rb") as f:
-            await message.reply_document(
+            await reply_document_cd(
+                message,
                 document=f,
                 filename=log_file.name,
                 caption="Лог сборки",
@@ -496,49 +519,62 @@ async def _perform_merge(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
     except Exception as e:
         logger.warning("Не удалось отправить лог сборки: %s", e)
 
+    exe_sent = False
+    build_failed = False
     if not exe_path or not exe_path.exists():
-        await message.reply_text(
-            "Не удалось собрать исполняемый файл. Проверьте лог.",
-            reply_markup=build_menu_kb(state),
-        )
-        return
-
-    try:
-        size = exe_path.stat().st_size
-        if size <= TG_UPLOAD_LIMIT:
-            with exe_path.open("rb") as f:
-                await message.reply_document(
-                    document=f,
-                    filename=exe_path.name,
-                    caption="Готовый .exe",
-                )
-        else:
-            await message.reply_text(
-                "EXE крупный, упаковываю в ZIP…",
-                reply_markup=build_menu_kb(state),
-            )
-            zip_path = exe_path.with_suffix(".zip")
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-                zf.write(exe_path, arcname=exe_path.name)
-            if zip_path.stat().st_size <= TG_UPLOAD_LIMIT:
-                with zip_path.open("rb") as f:
-                    await message.reply_document(
+        await reply_text_cd(message, "Не удалось собрать исполняемый файл. Проверьте лог.")
+        build_failed = True
+    else:
+        try:
+            size = exe_path.stat().st_size
+            if size <= TG_UPLOAD_LIMIT:
+                with exe_path.open("rb") as f:
+                    await reply_document_cd(
+                        message,
                         document=f,
-                        filename=zip_path.name,
-                        caption="Готовый .exe (ZIP)",
+                        filename=exe_path.name,
+                        caption="Готовый .exe",
                     )
+                    exe_sent = True
             else:
-                await message.reply_text(
-                    "EXE собран, но слишком большой для отправки через Telegram, даже в ZIP. "
-                    f"Путь к файлу на сервере: {exe_path}",
-                    reply_markup=build_menu_kb(state),
-                )
-    except Exception as e:
-        logger.exception("Ошибка при отправке exe")
-        await message.reply_text(
-            f"EXE собран, но не удалось отправить: {e}\nПуть к файлу: {exe_path}",
-            reply_markup=build_menu_kb(state),
-        )
+                await reply_text_cd(message, "EXE крупный, упаковываю в ZIP…")
+                zip_path = exe_path.with_suffix(".zip")
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+                    zf.write(exe_path, arcname=exe_path.name)
+                if zip_path.stat().st_size <= TG_UPLOAD_LIMIT:
+                    with zip_path.open("rb") as f:
+                        await reply_document_cd(
+                            message,
+                            document=f,
+                            filename=zip_path.name,
+                            caption="Готовый .exe (ZIP)",
+                        )
+                        exe_sent = True
+                else:
+                    await reply_text_cd(
+                        message,
+                        "EXE собран, но слишком большой для отправки через Telegram, даже в ZIP. "
+                        f"Путь к файлу на сервере: {exe_path}",
+                    )
+        except Exception as e:
+            logger.exception("Ошибка при отправке exe")
+            await reply_text_cd(
+                message,
+                f"EXE собран, но не удалось отправить: {e}\nПуть к файлу: {exe_path}",
+            )
+
+    if build_failed:
+        summary = "Сборка завершилась с ошибкой. Проверьте лог."
+    elif exe_sent:
+        summary = "Сборка завершена. Все файлы отправлены."
+    else:
+        summary = "Сборка завершена. Проверьте отправленные сообщения."
+
+    await reply_text_cd(
+        message,
+        f"{summary} Используйте кнопки ниже, чтобы продолжить.",
+        reply_markup=build_menu_kb(PendingMerge()),
+    )
 
 
 async def _perform_merge_from_callback(
@@ -558,7 +594,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             if isinstance(err, BadRequest) and "File is too big" in str(err):
                 msg = ("Файл слишком большой для скачивания ботом через API Telegram (жёсткий лимит около 20 МБ). "
                        "Пожалуйста, используйте файл меньшего размера.")
-            await update.effective_message.reply_text(msg)
+            await reply_text_cd(update.effective_message, msg)
     except Exception:
         logger.debug("Не удалось отправить сообщение об ошибке пользователю")
 
