@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import sys
 import time
@@ -16,7 +15,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -159,6 +158,9 @@ class PendingMerge:
             self.icon = (filename, data)
         else:
             self.files.append((filename, data))
+            if len(self.files) > 2:
+                # Храним только два последних файла для склейки
+                self.files = self.files[-2:]
 
     def ready(self) -> bool:
         return len(self.files) >= 2
@@ -170,8 +172,14 @@ STATES: Dict[int, PendingMerge] = {}
 
 # === ВСПОМОГАТЕЛЬНОЕ: клавиатуры ===
 def build_menu_kb(state: PendingMerge) -> InlineKeyboardMarkup:
+    """Формирует inline-клавиатуру со всеми действиями."""
+
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton("📂 Загрузить файлы", callback_data="files_prompt"),
+                InlineKeyboardButton("🚀 Собрать", callback_data="merge_now"),
+            ],
             [
                 InlineKeyboardButton("🖼 Сменить иконку", callback_data="icon_change"),
                 InlineKeyboardButton("🧹 Удалить иконку", callback_data="icon_clear"),
@@ -222,8 +230,8 @@ def _parse_options(text: str) -> Dict[str, str]:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Команда: /merge [base=myapp] [windowed=1|0]\n"
-        "Пожалуйста, пришлите два файла для склейки. Можно прислать иконку (.ico/.icns/.png). "
-        "На выходе бот соберёт .exe и пришлёт результат.",
+        "Используйте кнопки ниже, чтобы управлять процессом.\n"
+        "Лимит на один файл — 100 МБ. Telegram дополнительно ограничивает скачивание ботом файлами ≈20 МБ.",
         reply_markup=build_menu_kb(STATES.get(update.effective_user.id, PendingMerge())),
     )
 
@@ -248,20 +256,52 @@ async def cmd_merge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     STATES[uid] = state
     await update.message.reply_text(
-        "Готово. Пожалуйста, пришлите два файла.\n" + state_summary(state),
+        "Готово. Пожалуйста, пришлите два файла (лимит 100 МБ на каждый).\n" + state_summary(state),
         reply_markup=build_menu_kb(state),
     )
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.callback_query:
+        return
+
     q = update.callback_query
+
+    # Ограничение частоты и для callback-запросов
+    if update.effective_user:
+        uid = update.effective_user.id
+        now = time.time()
+        last = _LAST_MSG_TS.get(uid, 0.0)
+        if now - last < COOLDOWN_SECONDS:
+            await q.answer(
+                "Вы нажимаете слишком часто. Подождите чуть-чуть и попробуйте снова.",
+                show_alert=True,
+            )
+            return
+        _LAST_MSG_TS[uid] = now
+
     await q.answer()
     uid = update.effective_user.id
     state = STATES.get(uid) or PendingMerge()
     STATES[uid] = state
 
     data = q.data or ""
-    if data == "icon_change":
+    if data == "files_prompt":
+        await q.edit_message_text(
+            "Пожалуйста, отправьте два файла для склейки (форматы .py, .txt и т.п.).",
+            reply_markup=build_menu_kb(state),
+        )
+    elif data == "merge_now":
+        if state.ready():
+            await q.edit_message_text("Запускаю сборку…", reply_markup=build_menu_kb(state))
+            await _perform_merge_from_callback(update, context, state)
+            STATES.pop(uid, None)
+        else:
+            await q.edit_message_text(
+                "Недостаточно файлов для сборки. Нужно минимум два файла.",
+                reply_markup=build_menu_kb(state),
+            )
+    elif data == "icon_change":
         state.awaiting_icon = True
         await q.edit_message_text(
             "Режим смены иконки включён. Пожалуйста, пришлите файл иконки (.ico/.icns/.png).",
@@ -281,7 +321,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.edit_message_text(state_summary(state), reply_markup=build_menu_kb(state))
     elif data == "reset":
         STATES.pop(uid, None)
-        await q.edit_message_text("Состояние сброшено. Пожалуйста, начните заново: /merge", reply_markup=build_menu_kb(PendingMerge()))
+        await q.edit_message_text(
+            "Состояние сброшено. Пожалуйста, начните заново: /merge",
+            reply_markup=build_menu_kb(PendingMerge()),
+        )
     else:
         await q.edit_message_text("Неизвестное действие.", reply_markup=build_menu_kb(state))
 
@@ -303,7 +346,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if doc.file_size and doc.file_size > USER_DOWNLOAD_LIMIT:
         mb = doc.file_size / (1024 * 1024)
         await update.message.reply_text(
-            f"Вы отправили слишком большой файл ({mb:.1f} МБ). У вас лимит 100 МБ на файл."
+            f"Вы отправили слишком большой файл ({mb:.1f} МБ). У вас лимит 100 МБ на файл.",
+            reply_markup=build_menu_kb(state),
         )
         return
 
@@ -311,11 +355,15 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if doc.file_size and doc.file_size > TG_GETFILE_HARD_LIMIT:
         await update.message.reply_text(
             "Файл больше ≈20 МБ. Telegram не позволяет ботам скачивать такие файлы через API. "
-            "Даже при лимите 100 МБ это ограничение нельзя обойти."
+            "Даже при лимите 100 МБ это ограничение нельзя обойти.",
+            reply_markup=build_menu_kb(state),
         )
         return
 
-    await update.message.reply_text(f"Принимаю «{fname}»…")
+    await update.message.reply_text(
+        f"Принимаю «{fname}»…",
+        reply_markup=build_menu_kb(state),
+    )
     try:
         file = await doc.get_file()
         bio = BytesIO()
@@ -323,15 +371,31 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         data = bio.getvalue()
     except BadRequest as e:
         logger.warning("BadRequest on get_file: %s", e)
-        await update.message.reply_text("Не удалось скачать файл. Пожалуйста, попробуйте меньший файл.")
+        await update.message.reply_text(
+            "Не удалось скачать файл. Пожалуйста, попробуйте меньший файл.",
+            reply_markup=build_menu_kb(state),
+        )
         return
     except Exception as e:
         logger.exception("Ошибка скачивания файла")
-        await update.message.reply_text(f"Не удалось скачать «{fname}»: {e}")
+        await update.message.reply_text(
+            f"Не удалось скачать «{fname}»: {e}",
+            reply_markup=build_menu_kb(state),
+        )
         return
 
     if not isinstance(data, (bytes, bytearray)):
-        await update.message.reply_text("Не удалось получить содержимое файла.")
+        await update.message.reply_text(
+            "Не удалось получить содержимое файла.",
+            reply_markup=build_menu_kb(state),
+        )
+        return
+
+    if len(data) > USER_DOWNLOAD_LIMIT:
+        await update.message.reply_text(
+            "Полученный файл превышает лимит 100 МБ после скачивания. Пожалуйста, отправьте меньший файл.",
+            reply_markup=build_menu_kb(state),
+        )
         return
 
     # Сохранение как иконка/обычный файл с учётом режима
@@ -350,7 +414,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     else:
         await update.message.reply_text(
-            f"Иконка обновлена: {fname}.", reply_markup=build_menu_kb(state)
+            f"Иконка обновлена: {fname}.",
+            reply_markup=build_menu_kb(state),
         )
 
     if state.ready():
@@ -359,6 +424,10 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def _perform_merge(update: Update, context: ContextTypes.DEFAULT_TYPE, state: PendingMerge) -> None:
+    message = update.effective_message
+    if not message or not update.effective_user:
+        return
+
     uid = update.effective_user.id
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path("out") / str(uid) / ts
@@ -366,7 +435,7 @@ async def _perform_merge(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
 
     (n1, b1), (n2, b2) = state.files[0], state.files[1]
 
-    await update.message.reply_text("Склеиваю файлы…")
+    await message.reply_text("Склеиваю файлы…", reply_markup=build_menu_kb(state))
     t1, enc1 = read_text_best_effort_bytes(b1)
     t2, enc2 = read_text_best_effort_bytes(b2)
     merged_text = merge_contents(t1, t2, n1, n2)
@@ -380,18 +449,29 @@ async def _perform_merge(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
 
     try:
         with merged_py.open("rb") as f:
-            await update.message.reply_document(
-                document=f, filename=merged_py.name, caption=f"*_merged.py (кодировки: {enc1}, {enc2})", parse_mode=ParseMode.MARKDOWN
+            await message.reply_document(
+                document=f,
+                filename=merged_py.name,
+                caption=f"*_merged.py (кодировки: {enc1}, {enc2})",
+                parse_mode=ParseMode.MARKDOWN,
             )
         with pyinstall_path.open("rb") as f:
-            await update.message.reply_document(
-                document=f, filename=pyinstall_path.name, caption="*.pyinstall"
+            await message.reply_document(
+                document=f,
+                filename=pyinstall_path.name,
+                caption="*.pyinstall",
             )
     except Exception as e:
         logger.exception("Ошибка отправки текстовых артефактов")
-        await update.message.reply_text(f"Ошибка отправки промежуточных файлов: {e}")
+        await message.reply_text(
+            f"Ошибка отправки промежуточных файлов: {e}",
+            reply_markup=build_menu_kb(state),
+        )
 
-    await update.message.reply_text("Собираю .exe через PyInstaller…")
+    await message.reply_text(
+        "Собираю .exe через PyInstaller…",
+        reply_markup=build_menu_kb(state),
+    )
 
     # Сборка EXE — всегда включена
     icon_path: Optional[Path] = None
@@ -408,35 +488,65 @@ async def _perform_merge(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
 
     try:
         with log_file.open("rb") as f:
-            await update.message.reply_document(document=f, filename=log_file.name, caption="Лог сборки")
+            await message.reply_document(
+                document=f,
+                filename=log_file.name,
+                caption="Лог сборки",
+            )
     except Exception as e:
         logger.warning("Не удалось отправить лог сборки: %s", e)
 
     if not exe_path or not exe_path.exists():
-        await update.message.reply_text("Не удалось собрать исполняемый файл. Проверьте лог.")
+        await message.reply_text(
+            "Не удалось собрать исполняемый файл. Проверьте лог.",
+            reply_markup=build_menu_kb(state),
+        )
         return
 
     try:
         size = exe_path.stat().st_size
         if size <= TG_UPLOAD_LIMIT:
             with exe_path.open("rb") as f:
-                await update.message.reply_document(document=f, filename=exe_path.name, caption="Готовый .exe")
+                await message.reply_document(
+                    document=f,
+                    filename=exe_path.name,
+                    caption="Готовый .exe",
+                )
         else:
-            await update.message.reply_text("EXE крупный, упаковываю в ZIP…")
+            await message.reply_text(
+                "EXE крупный, упаковываю в ZIP…",
+                reply_markup=build_menu_kb(state),
+            )
             zip_path = exe_path.with_suffix(".zip")
             with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
                 zf.write(exe_path, arcname=exe_path.name)
             if zip_path.stat().st_size <= TG_UPLOAD_LIMIT:
                 with zip_path.open("rb") as f:
-                    await update.message.reply_document(document=f, filename=zip_path.name, caption="Готовый .exe (ZIP)")
+                    await message.reply_document(
+                        document=f,
+                        filename=zip_path.name,
+                        caption="Готовый .exe (ZIP)",
+                    )
             else:
-                await update.message.reply_text(
+                await message.reply_text(
                     "EXE собран, но слишком большой для отправки через Telegram, даже в ZIP. "
-                    f"Путь к файлу на сервере: {exe_path}"
+                    f"Путь к файлу на сервере: {exe_path}",
+                    reply_markup=build_menu_kb(state),
                 )
     except Exception as e:
         logger.exception("Ошибка при отправке exe")
-        await update.message.reply_text(f"EXE собран, но не удалось отправить: {e}\nПуть к файлу: {exe_path}")
+        await message.reply_text(
+            f"EXE собран, но не удалось отправить: {e}\nПуть к файлу: {exe_path}",
+            reply_markup=build_menu_kb(state),
+        )
+
+
+async def _perform_merge_from_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: PendingMerge
+) -> None:
+    """Отдельный запуск сборки из callback-запроса."""
+
+    await _perform_merge(update, context, state)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
