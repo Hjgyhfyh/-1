@@ -32,6 +32,12 @@ BOT_TOKEN = "7427775003:AAHIHeZiiHJXoGXLdFjS3qCTbbaeLyzn1FU"
 
 # Сайт для удалённого управления ПК по запросу пользователя
 REMOTE_CONTROL_URL = "https://remotedesktop.google.com/access"
+REMOTE_CONTROL_MESSAGE = (
+    "Для удалённого доступа используйте официальный сервис Google Remote Desktop.\n"
+    "1. Откройте ссылку: {url}\n"
+    "2. Авторизуйтесь в аккаунте Google.\n"
+    "3. Следуйте инструкциям на экране, чтобы предоставить доступ."
+)
 
 # === ЛИМИТЫ ===
 # Пользовательский лимит: 100 МБ (проверяем заранее и уведомляем)
@@ -284,7 +290,7 @@ def _parse_options(text: str) -> Dict[str, str]:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_text_cd(
         update.message,
-        "Команда: /merge [base=myapp] [windowed=1|0]\n"
+        "Команды: /merge [base=myapp] [windowed=1|0], /reset, /remote\n"
         "Используйте кнопки ниже, чтобы управлять процессом.\n"
         "Лимит на один файл — 100 МБ. Telegram дополнительно ограничивает скачивание ботом файлами ≈20 МБ.",
         reply_markup=build_menu_kb(STATES.get(update.effective_user.id, PendingMerge())),
@@ -302,6 +308,14 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         update.message,
         "Состояние сброшено.",
         reply_markup=build_menu_kb(PendingMerge()),
+    )
+
+
+async def cmd_remote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reply_text_cd(
+        update.message,
+        REMOTE_CONTROL_MESSAGE.format(url=REMOTE_CONTROL_URL),
+        disable_web_page_preview=True,
     )
 
 
@@ -644,6 +658,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler(["start", "help"], cmd_start), group=1)
     app.add_handler(CommandHandler("reset", cmd_reset), group=1)
     app.add_handler(CommandHandler("merge", cmd_merge), group=1)
+    app.add_handler(CommandHandler("remote", cmd_remote), group=1)
     app.add_handler(CallbackQueryHandler(on_callback), group=1)
     app.add_handler(MessageHandler(filters.Document.ALL, on_document), group=1)
 
