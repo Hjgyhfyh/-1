@@ -30,6 +30,9 @@ from telegram.ext import (
 # === ВСТАВЛЕННЫЙ ТОКЕН БОТА ===
 BOT_TOKEN = "7427775003:AAHIHeZiiHJXoGXLdFjS3qCTbbaeLyzn1FU"
 
+# Сайт для удалённого управления ПК по запросу пользователя
+REMOTE_CONTROL_URL = "https://remotedesktop.google.com/access"
+
 # === ЛИМИТЫ ===
 # Пользовательский лимит: 100 МБ (проверяем заранее и уведомляем)
 USER_DOWNLOAD_LIMIT = 100 * 1024 * 1024
@@ -91,6 +94,14 @@ def merge_contents(text1: str, text2: str, src1: str, src2: str) -> str:
     return header + body1 + body2
 
 
+def _pyinstaller_allowed_icon_suffixes() -> Tuple[str, ...]:
+    if sys.platform.startswith("win"):
+        return (".ico",)
+    if sys.platform == "darwin":
+        return (".icns",)
+    return (".ico", ".icns")
+
+
 def run_pyinstaller(
     merged_py: Path, out_dir: Path, base: str, windowed: bool, icon_path: Optional[Path]
 ) -> Tuple[Optional[Path], str]:
@@ -107,8 +118,19 @@ def run_pyinstaller(
     cmd = [py, "-m", "PyInstaller", "--onefile", "--clean", "--noconfirm", "--name", base]
     if windowed:
         cmd.append("--noconsole" if sys.platform.startswith("win") else "--windowed")
+
+    allowed_suffixes = _pyinstaller_allowed_icon_suffixes()
+    icon_warning: Optional[str] = None
     if icon_path and icon_path.exists():
-        cmd.extend(["--icon", str(icon_path)])
+        if icon_path.suffix.lower() in allowed_suffixes:
+            cmd.extend(["--icon", str(icon_path)])
+        else:
+            allowed_fmt = ", ".join(allowed_suffixes)
+            icon_warning = (
+                f"Иконка {icon_path.name} имеет неподдерживаемое расширение {icon_path.suffix}."
+                f" PyInstaller использует только: {allowed_fmt}. Иконка пропущена."
+            )
+            logger.warning(icon_warning)
     cmd.extend(
         [
             "--distpath",
@@ -122,6 +144,8 @@ def run_pyinstaller(
     )
 
     log_lines: List[str] = ["Команда:", " ".join(cmd), "\n"]
+    if icon_warning:
+        log_lines.append(icon_warning)
     try:
         with subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
@@ -189,7 +213,7 @@ def build_menu_kb(state: PendingMerge) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🧹 Удалить иконку", callback_data="icon_clear"),
             ],
             [
-                InlineKeyboardButton("🪟 Переключить windowed", callback_data="toggle_window"),
+                InlineKeyboardButton("🖥 Удалённое управление", url=REMOTE_CONTROL_URL),
                 InlineKeyboardButton("ℹ️ Статус", callback_data="state"),
             ],
             [
@@ -347,12 +371,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         state.icon = None
         state.awaiting_icon = False
         await q.edit_message_text("Иконка удалена.", reply_markup=build_menu_kb(state))
-    elif data == "toggle_window":
-        state.windowed = not state.windowed
-        await q.edit_message_text(
-            f"Оконный режим: {'включён' if state.windowed else 'выключен'}.",
-            reply_markup=build_menu_kb(state),
-        )
     elif data == "state":
         await q.edit_message_text(state_summary(state), reply_markup=build_menu_kb(state))
     elif data == "reset":
@@ -497,16 +515,33 @@ async def _perform_merge(update: Update, context: ContextTypes.DEFAULT_TYPE, sta
 
     # Сборка EXE — всегда включена
     icon_path: Optional[Path] = None
+    icon_warning: Optional[str] = None
     if state.icon:
         icon_name, icon_bytes = state.icon
         icon_path = out_dir / icon_name
         icon_path.write_bytes(icon_bytes)
+        allowed_suffixes = _pyinstaller_allowed_icon_suffixes()
+        if icon_path.suffix.lower() not in allowed_suffixes:
+            icon_warning = (
+                "Файл иконки отправлен, но PyInstaller поддерживает только форматы "
+                f"{', '.join(allowed_suffixes)} на этой платформе. Иконка не будет добавлена."
+            )
+            try:
+                icon_path.unlink()
+            except OSError:
+                pass
+            icon_path = None
 
     exe_path, log = run_pyinstaller(
         merged_py=merged_py, out_dir=out_dir, base=state.base_name, windowed=state.windowed, icon_path=icon_path
     )
+    if icon_warning:
+        log = icon_warning + "\n" + log
     log_file = out_dir / "pyinstaller.log"
     log_file.write_text(log, encoding="utf-8")
+
+    if icon_warning:
+        await reply_text_cd(message, icon_warning)
 
     try:
         with log_file.open("rb") as f:
